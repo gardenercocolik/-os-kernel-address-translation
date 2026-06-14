@@ -91,7 +91,7 @@ if (!state->thp_enabled) {
 **代码仓库链接：**
 
 - 本地仓库（当前工作区）：`file:///C:/Users/18316/Desktop/操作系统内核期末论文`
-- （可选）上传后替换为远程地址：`https://github.com/<your-account>/<repo-name>`
+- 当前提交版本：`02c9add4b5a2b26a16afbc1278b88cb8f7b78e70`
 
 ## 五、总结或小结
 
