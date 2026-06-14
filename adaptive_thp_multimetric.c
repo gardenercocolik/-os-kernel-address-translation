@@ -25,6 +25,12 @@ typedef struct {
     double score;
 } SampleMetrics;
 
+typedef enum {
+    MODE_ADAPTIVE = 0,
+    MODE_FORCE_OFF = 1,
+    MODE_FORCE_ON = 2
+} RunMode;
+
 typedef struct {
     int thp_enabled;
     int cooldown_left;
@@ -126,6 +132,12 @@ static void run_memory_workload(char *buf, size_t len, size_t loops) {
     }
 }
 
+static double elapsed_seconds(const struct timespec *start, const struct timespec *end) {
+    double sec = (double)(end->tv_sec - start->tv_sec);
+    double nsec = (double)(end->tv_nsec - start->tv_nsec) / 1e9;
+    return sec + nsec;
+}
+
 static double clamp01(double value) {
     if (value < 0.0) return 0.0;
     if (value > 1.0) return 1.0;
@@ -172,7 +184,7 @@ static SampleMetrics compute_metrics(
     return m;
 }
 
-static void maybe_switch_thp(
+static int maybe_switch_thp(
     ControllerState *state,
     char *buf,
     size_t len,
@@ -192,9 +204,10 @@ static void maybe_switch_thp(
                 state->stable_low_count = 0;
                 printf("[switch] THP ON  score=%.3f (dtlb=%.3f, llc=%.3f, pf=%.2f/s)\n",
                     m->score, m->dtlb_mpki, m->llc_mpki, m->pf_per_sec);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if (m->score < low_threshold) {
@@ -210,18 +223,28 @@ static void maybe_switch_thp(
             state->stable_low_count = 0;
             printf("[switch] THP OFF score=%.3f (dtlb=%.3f, llc=%.3f, pf=%.2f/s)\n",
                 m->score, m->dtlb_mpki, m->llc_mpki, m->pf_per_sec);
+            return -1;
         }
     }
+    return 0;
 }
 
 int main(int argc, char **argv) {
     const size_t default_len = 256UL * 1024UL * 1024UL;  /* 256 MB */
     const int default_seconds = 60;
-    const double sample_seconds = 1.0;
     const double high_threshold = 0.65;
     const double low_threshold = 0.35;
+    const size_t loops_per_window = 2;
     size_t len = default_len;
     int run_seconds = default_seconds;
+    RunMode mode = MODE_ADAPTIVE;
+    FILE *csv = NULL;
+    const char *mode_name = "adaptive";
+
+    /* Usage:
+     *   ./adaptive_thp_multimetric [mem_mb] [duration_s] [mode] [csv_path]
+     * mode: adaptive | off | on
+     */
 
     if (argc >= 2) {
         long mb = atol(argv[1]);
@@ -235,13 +258,36 @@ int main(int argc, char **argv) {
             run_seconds = sec;
         }
     }
+    if (argc >= 4) {
+        if (strcmp(argv[3], "adaptive") == 0) {
+            mode = MODE_ADAPTIVE;
+            mode_name = "adaptive";
+        } else if (strcmp(argv[3], "off") == 0) {
+            mode = MODE_FORCE_OFF;
+            mode_name = "off";
+        } else if (strcmp(argv[3], "on") == 0) {
+            mode = MODE_FORCE_ON;
+            mode_name = "on";
+        } else {
+            fprintf(stderr, "[error] invalid mode: %s (expected adaptive/off/on)\n", argv[3]);
+            return 1;
+        }
+    }
+    if (argc >= 5) {
+        csv = fopen(argv[4], "w");
+        if (!csv) {
+            fprintf(stderr, "[error] failed to open csv path %s: %s\n", argv[4], strerror(errno));
+            return 1;
+        }
+    }
 
     signal(SIGINT, on_sigint);
-    printf("[info] buffer=%zu MB, duration=%d s\n", len / 1024UL / 1024UL, run_seconds);
+    printf("[info] buffer=%zu MB, duration=%d s, mode=%s\n", len / 1024UL / 1024UL, run_seconds, mode_name);
 
     char *buf = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (buf == MAP_FAILED) {
         fprintf(stderr, "[error] mmap failed: %s\n", strerror(errno));
+        if (csv) fclose(csv);
         return 1;
     }
 
@@ -249,6 +295,7 @@ int main(int argc, char **argv) {
     if (init_counters(&ins, &dtlb, &llc, &pf) != 0) {
         fprintf(stderr, "[error] perf counters unavailable. Check perf_event_paranoid and permissions.\n");
         munmap(buf, len);
+        if (csv) fclose(csv);
         return 2;
     }
 
@@ -258,24 +305,70 @@ int main(int argc, char **argv) {
     pf.last_value = read_counter(pf.fd, pf.name);
 
     ControllerState state = {.thp_enabled = 0, .cooldown_left = 0, .stable_low_count = 0};
-    madvise(buf, len, MADV_NOHUGEPAGE);
+    if (mode == MODE_FORCE_ON) {
+        madvise(buf, len, MADV_HUGEPAGE);
+        state.thp_enabled = 1;
+    } else {
+        madvise(buf, len, MADV_NOHUGEPAGE);
+        state.thp_enabled = 0;
+    }
+
+    if (csv) {
+        fprintf(csv, "second,mode,score,dtlb_mpki,llc_mpki,pf_rate,work_ms,ops_per_sec,thp_state,switch_event\n");
+    }
 
     for (int t = 0; t < run_seconds && !g_stop; ++t) {
-        run_memory_workload(buf, len, 2);
+        struct timespec wstart = {0}, wend = {0}, win_start = {0}, win_end = {0};
+        clock_gettime(CLOCK_MONOTONIC, &win_start);
+        clock_gettime(CLOCK_MONOTONIC, &wstart);
+        run_memory_workload(buf, len, loops_per_window);
+        clock_gettime(CLOCK_MONOTONIC, &wend);
         struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
         nanosleep(&ts, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &win_end);
 
-        SampleMetrics m = compute_metrics(&ins, &dtlb, &llc, &pf, sample_seconds);
-        maybe_switch_thp(&state, buf, len, &m, high_threshold, low_threshold);
+        double window_seconds = elapsed_seconds(&win_start, &win_end);
+        if (window_seconds <= 0.0) window_seconds = 1.0;
+        double work_seconds = elapsed_seconds(&wstart, &wend);
+        if (work_seconds <= 1e-9) work_seconds = 1e-9;
+        double work_ms = work_seconds * 1000.0;
 
-        printf("[t=%02d] score=%.3f dtlb_mpki=%.3f llc_mpki=%.3f pf_rate=%.2f/s state=%s\n",
+        SampleMetrics m = compute_metrics(&ins, &dtlb, &llc, &pf, window_seconds);
+        int switch_event = 0;
+        if (mode == MODE_ADAPTIVE) {
+            switch_event = maybe_switch_thp(&state, buf, len, &m, high_threshold, low_threshold);
+        }
+
+        size_t pages = len / 4096;
+        double ops_per_sec = (double)(pages * loops_per_window) / work_seconds;
+
+        printf("[t=%02d] score=%.3f dtlb_mpki=%.3f llc_mpki=%.3f pf_rate=%.2f/s work_ms=%.2f ops/s=%.0f state=%s\n",
             t + 1,
             m.score,
             m.dtlb_mpki,
             m.llc_mpki,
             m.pf_per_sec,
+            work_ms,
+            ops_per_sec,
             state.thp_enabled ? "THP_ON" : "THP_OFF");
         fflush(stdout);
+
+        if (csv) {
+            fprintf(
+                csv,
+                "%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.2f,%s,%d\n",
+                t + 1,
+                mode_name,
+                m.score,
+                m.dtlb_mpki,
+                m.llc_mpki,
+                m.pf_per_sec,
+                work_ms,
+                ops_per_sec,
+                state.thp_enabled ? "THP_ON" : "THP_OFF",
+                switch_event
+            );
+        }
     }
 
     close_counter(&ins);
@@ -283,5 +376,6 @@ int main(int argc, char **argv) {
     close_counter(&llc);
     close_counter(&pf);
     munmap(buf, len);
+    if (csv) fclose(csv);
     return 0;
 }

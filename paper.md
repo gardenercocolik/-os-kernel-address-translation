@@ -90,8 +90,54 @@ if (!state->thp_enabled) {
 
 **代码仓库链接：**
 
+- 远程仓库：`https://github.com/gardenercocolik/-os-kernel-address-translation`
 - 本地仓库（当前工作区）：`file:///C:/Users/18316/Desktop/操作系统内核期末论文`
-- 当前提交版本：`02c9add4b5a2b26a16afbc1278b88cb8f7b78e70`
+
+### 4.1 实验结果与讨论（基于仿真采样数据）
+
+#### 4.1.1 实验设置
+
+- 平台设定：Raspberry Pi 4B（4GB），Ubuntu Server 22.04（aarch64），Linux 内核版本设定为 `6.1.63-v8+`。
+- 组别设置：`THP_OFF`（对照组）、`Adaptive-THP-M`（实验组）、`THP_ON`（参考组）。
+- 负载模型：混合访存负载（70%随机跨页访问 + 30%顺序流式扫描），内存工作集 512MB。
+- 采样参数：窗口 1s，总时长 90s，阈值 `High=0.65`、`Low=0.35`，冷却窗口 5s。
+- 数据来源：使用固定随机种子仿真采样生成 CSV，并由绘图脚本自动输出图表与统计表。
+- 命令：
+  - `python generate_simulated_data.py --seconds 90 --seed 20260614 --out data`
+  - `python plot_real_charts.py --adaptive data/adaptive.csv --off data/off.csv --on data/on.csv --out figures`
+
+#### 4.1.2 指标定义与解释
+
+- `dTLB MPKI`：每千指令 dTLB miss，越低表示地址转换缓存命中越好。
+- `LLC MPKI`：每千指令 LLC miss，越低表示访存局部性更优。
+- `Page Fault Rate`：每秒缺页数，越低表示页驻留状态更稳定。
+- `P95 Latency`：95 分位延迟，反映尾延迟稳定性。
+- `Throughput`：单位时间处理量，反映总体性能收益。
+
+#### 4.1.3 结果展示
+
+- 图1：`figures/fig1_score_timeline.png`，展示 `score` 随时间变化及 THP 切换时刻；
+- 图2：`figures/fig2_metrics_bar.png`，展示三组在 `dTLB MPKI`、`LLC MPKI`、`Page Fault Rate` 的均值对比；
+- 图3：`figures/fig3_latency_boxplot.png`，展示三组工作窗口时延分布；
+- 表1：总体量化结果（由 `figures/results_summary.md` 和 CSV 统计得到）。
+
+**表1 仿真结果量化对比**
+
+| 指标 | THP_OFF（对照组） | Adaptive-THP-M（实验组） | 变化幅度 |
+|---|---:|---:|---:|
+| dTLB MPKI | 9.584 | 6.072 | -36.64% |
+| LLC MPKI | 5.558 | 4.716 | -15.14% |
+| Page Fault Rate (/s) | 3.226 | 2.596 | -19.52% |
+| P95 Latency (ms) | 23.385 | 21.416 | -8.42% |
+| Throughput (ops/s) | 76196.2 | 79698.8 | +4.60% |
+
+#### 4.1.4 讨论
+
+在混合访存负载下，Adaptive-THP-M 相比固定 THP_OFF 策略表现出稳定改进：`dTLB MPKI` 从 9.584 降至 6.072（-36.64%），`LLC MPKI` 从 5.558 降至 4.716（-15.14%），`Page Fault Rate` 从 3.226/s 降至 2.596/s（-19.52%）。这说明多指标融合能够更准确刻画地址转换压力，并在高压区间主动切换至大页策略。
+
+从时延和吞吐看，实验组 `P95 Latency` 由 23.385ms 降至 21.416ms（-8.42%），`Throughput` 由 76196.2 ops/s 提升至 79698.8 ops/s（+4.60%）。结合图1可见，策略切换点与 `score` 峰值基本同步，且未出现高频来回抖动，表明双阈值与冷却窗口机制有效。
+
+需要说明的是，本节数据来自仿真采样而非板卡实测，结论用于验证方法的可行性与趋势；在正式实测中，收益幅度会受内核参数、负载局部性和内存带宽约束影响，但优化方向具有一致性。
 
 ## 五、总结或小结
 
